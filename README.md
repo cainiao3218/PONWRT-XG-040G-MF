@@ -15,6 +15,8 @@
 │   ├── an7583.config                # ponwrt 官方 an7583 基线（含 mf 与 mf-ubi 两个 profile）
 │   └── mf-extras.config             # 本仓库的增量配置（PON 包、工具、可选项）
 ├── files/                           # rootfs 覆盖层：从原厂 MD 固件导出的 ONU 管理界面
+├── tools/
+│   └── preflash-dump.sh             # 刷前体检脚本（纯只读，生成状态快照）
 └── README.md
 ```
 
@@ -134,6 +136,50 @@ make -j$(nproc)
 
 原始数据都在本地备份里（`mtd6_bosa.bin`、`mtd7_ri.bin`、`mtd16_all_flash.bin`），刷完固件按下面第 6 步写回即可。**这不是不可逆的损坏。**
 
+### 第 0 步：刷前体检（必做，5 分钟）
+
+刷之前先把当前系统的状态存一份。**这一步不能跳过**，原因很实在：
+
+| 要解决的问题 | 没有基线会怎样 |
+|---|---|
+| 刷完如果起不来，怎么判断卡在哪 | 不知道刷之前 `bootcmd` 指向什么，只能瞎猜 |
+| 刷完如果 MAC 不对 / 光口不通 | 没有「刷之前是什么样」的对照，分不清是固件问题还是校准问题 |
+| `bosa`/`ri` 卷现在到底是不是空的 | 只能靠推测。实测一次就有确定答案 |
+| NAND 坏块在哪 | 如果坏块正好压在 `fit` 卷上，第一次启动可能失败一次 |
+
+脚本在本仓库 `tools/preflash-dump.sh`，**纯只读**，只会在设备 `/tmp` 下生成一个文本报告，不碰任何分区、不写任何卷、不改 U-Boot 环境变量。
+
+**跑法（Windows 上推荐这两步，最稳）：**
+
+```powershell
+scp tools\preflash-dump.sh root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 sh /tmp/preflash-dump.sh
+```
+
+跑完屏幕上会直接打印「关键结论摘要」这一节，然后：
+
+```powershell
+scp root@192.168.1.1:/tmp/preflash-dump.txt .
+```
+
+> ⚠️ 别用 PowerShell 的 `<` 重定向写法（`ssh ... "sh -s" < script.sh`）——PowerShell 5.1 不支持输入重定向，会直接报语法错。上面这两条 `scp` + `ssh` 没有这个问题。
+
+**报告里最该看的三行：**
+
+```
+bootcmd           : ubi read ... fit; bootm ...     ← 指向 fit 卷，刷完能自动启动
+当前 br-lan MAC   : e0:3d:a6:9e:b6:bf               ← 说明 ri 卷里还有数据
+  bosa : 存在   ubi0_4   data_bytes=0               ← data_bytes=0 才是空卷
+```
+
+- `bootcmd` 如果指向 `http`/`web`，说明默认进网页模式，刷完要手动点一次启动（不致命）
+- MAC 是 `02:` 开头 → `ri` 确实是空的，写回一步不能省
+- `bosa` 的 `data_bytes` 大于 0 → 卷里居然还有数据，那刷完可能不用写（但保险起见还是写一遍）
+
+把 `preflash-dump.txt` 取回来之后发我，我逐项核对，给你一份**针对这台机器**的精确刷机顺序，而不是通用模板。
+
+### 第 1 步：刷写固件
+
 刷写步骤：
 
 1. 网线接 LAN 口，浏览器打开 Web-U-Boot 页面
@@ -141,11 +187,10 @@ make -j$(nproc)
 3. 点「上传并刷写」
 4. **不要勾「重建 UBI」** —— 已经重建过了，再建一次只会又擦一遍，没有任何好处
 5. 页面会核对文件名里的机型与 `/info` 的 model 是否一致，一致才显示绿框
-6. 刷完重启后，**立刻写回 `bosa` 和 `ri`**（见下节）
 
 > ⚠️ 网页 U-Boot 只接受 **`-ubi-squashfs-sysupgrade.itb`**，不要传 `-initramfs-recovery.itb`（那是内存救援系统，不能当系统刷）。
 
-### 刷完之后：写回 bosa 与 ri（必做）
+### 第 2 步：写回 bosa 与 ri（必做）
 
 固件里已内置 `restore-pon-identity.sh`（`/usr/sbin/`），会自动补建缺失的卷、把容量对齐到 LEB 整数倍、写完回读比对 md5。
 
@@ -168,7 +213,7 @@ reboot
 
 如果系统起不来、只能在网页 U-Boot 里操作，用救砖页的「**按卷写入**」分别写 `bosa` 和 `ri`，效果相同。
 
-### 刷机后的三项验证
+### 第 3 步：刷机后的三项验证
 
 ```sh
 ip link show br-lan        # MAC 必须是 E0:3D:A6:9E:B6:BF
