@@ -1,6 +1,12 @@
 name: Build OpenWrt for Nokia XG-040G-MF
 
 on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.gitattributes'
   workflow_dispatch:
     inputs:
       ponwrt_ref:
