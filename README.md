@@ -20,9 +20,9 @@
 
 ---
 
-## 需要你配合的 4 件事
+## 状态与待办
 
-### 1. 提供一个 GitHub 仓库
+### 1. 一个 GitHub 仓库（唯一阻塞项）
 
 编译在 GitHub Actions 上跑（本机没有 Linux 环境，且 OpenWrt 全量编译要 40GB 以上）。
 
@@ -31,7 +31,7 @@
 - **你把本目录推到你的空仓库**（`git init && git add -A && git commit -m init && git push`），然后在仓库页面点 Actions → Build OpenWrt for Nokia XG-040G-MF → Run workflow。
 - **把仓库地址和 PAT 给我**，我直接推。
 
-### 2. 确认软件源
+### 2. 软件源（保持 ponwrt 默认）
 
 `ponwrt` 的 feeds 指向 **ImmortalWrt** 的 `packages` 与 `luci`（不是 OpenWrt 官方源）：
 
@@ -44,24 +44,21 @@ src-git pon_userspace  https://github.com/pbs05/openwrt-pon-userspace.git
 
 如果你更希望用 OpenWrt 官方源，告诉我，我改 `feeds.conf.default`。
 
-### 3. 选定可选包
+### 3. 可选包（已确认）
 
-MF 是 **2×A53 @1.2 GHz + 512 MiB**，跑不动一整套全家桶。`configs/mf-extras.config` 第四节列了可选项，默认全关。建议：
+用途：**光猫 + 路由**，外加一个全局去广告包。对应 `configs/mf-extras.config`：
 
-| 用途 | 建议 |
-|---|---|
-| 只当光猫 + 路由 | 全关（默认就是） |
-| 需要科学上网 | 只开 `luci-app-openclash`，别开 samba |
-| 需要局域网共享 | 只开 `luci-app-ksmbd`，别开 clash |
-| 需要 IPTV 组播 | 开 `rtp2httpd`（很轻，推荐） |
+- 第四节已启用 `adblock-fast` + `luci-app-adblock-fast` + 中文语言包
+- 第五节其余可选项（openclash / samba / ksmbd / vlmcsd / rtp2httpd / usb-printer）全部关闭
 
-### 4. 提供原厂备份信息（防砖，不是编译必需）
+> adblock-fast 走 **nftset 模式**（基线配置里 `dnsmasq-full` 已开 `dnsmasq_full_nftset=y`），
+> 命中规则由 nftables 直接拦，不靠改 hosts，性能损耗可以忽略。
 
-- `bosa` 与 `ri` 的 dump 文件（你已有，刷完机要写回去）
-- 原厂 `cat /proc/mtd` 输出
-- 原厂 U-Boot 环境变量（`fw_printenv` 或串口里 `printenv`）
+### 4. 原厂备份（已具备）
 
-用途：核对 MF 的 `bl2` 大小与 `ubi` 起始偏移是否和 DTS 里的 `reg = <0x20000 0xffe0000>` 一致。**不同批次的 MF 有换过 NAND 的情况**，这一步能提前发现雷。
+`bosa` 与 `ri` 已有备份。补一条核对建议：若方便，把原厂 `cat /proc/mtd` 贴一下，
+用于确认你这批次的 NAND 颗粒与 `bl2` 大小是否和 DTS 的 `reg = <0x20000 0xffe0000>` 一致。
+**不同批次的 MF 换过颗粒**，这一步能在刷之前发现问题。
 
 ---
 
@@ -115,18 +112,29 @@ make -j$(nproc)
 
 ---
 
-## 刷机顺序
+## 刷机顺序（已刷第三方 Web-U-Boot 的情况）
 
-> ⚠️ 下列步骤**只适用于 MF**。MD 的教程（tcboot 那一套）不适用，套错直接变砖。
+> 前提：MF 已刷 [Loong1996/ImmortalWrt-Airoha](https://github.com/Loong1996/ImmortalWrt-Airoha) 的
+> 魔改 OpenWrt U-Boot（`ubi` 变体，带网页救砖），即分区已是 `bl2`(128 KiB) + `ubi`(255.875 MiB)。
 
-1. **备份**：TTL 进 U-Boot，确认 `bosa`、`ri` 两个卷已备份到你手上
-2. **刷引导**（若已是第三方 U-Boot 可跳过）：
-   - 断电按住 Reset 上电，出现 `Press X` 时按 `X`
-   - XMODEM 传 `*-preloader.bin`
-   - 再按 `X`，XMODEM 传 `*-bl31-uboot.fip`
-3. **重建 UBI**：网线接 LAN，浏览器开 `http://192.168.0.1/`，点"重建 UBI 分区"
-4. **恢复校准**：先写 `bosa`，再写 `ri`（顺序不要反）
-5. **刷固件**：上传 `*-sysupgrade.itb`，或之后在 LuCI 里直接升级
+**本固件与那套 U-Boot 兼容**，原因有三：
+
+1. 分区布局完全一致 —— ponwrt 与该项目都用 `bl2 @0x0` + `ubi @0x20000`；
+2. 卷名一致 —— `fit` / `fip` / `ubootenv` / `ubootenv2` / `bosa` / `ri`；
+3. 镜像格式一致 —— 都是标准 FIT（kernel + fdt + rootfs），load 地址 `0x80200000`。
+
+刷写步骤：
+
+1. 网线接 LAN 口，浏览器打开 Web-U-Boot 页面
+2. 左栏「**日常刷机**」里选 `...-nokia_xg-040g-mf-ubi-squashfs-sysupgrade.itb`
+3. 点「上传并刷写」
+4. **不要勾「重建 UBI」** —— UBI 已经挂得上，重建会连 `ri`（MAC）和 `bosa`（光模块校准）一起擦掉
+5. 页面会核对文件名里的机型与 `/info` 的 model 是否一致，一致才显示绿框
+
+刷完后如发现 MAC 变成随机值，说明 `ri` 卷被覆盖了 —— 用网页救砖页的「按卷写入」把 `ri` 备份写回去即可，不影响开机。
+
+> ⚠️ 网页 U-Boot 只接受 **`-ubi-squashfs-sysupgrade.itb`**，不要传 `-initramfs-recovery.itb`（那是内存救援系统，不能当系统刷）。
+
 
 ---
 
@@ -135,6 +143,8 @@ make -j$(nproc)
 | 项目 | 状态 |
 |---|---|
 | `luci-app-onu`（原厂那套上网/IPTV/语音/诊断界面） | 已从你的 MD 固件完整导出，放在 `files/`，随固件一起打包 |
+| 全局去广告 | `adblock-fast` 已编入，LuCI → 服务 → AdBlock Fast，首次使用需在页面里「启用」并下载订阅列表 |
 | 语音页面 | MF 没有 FXS 接口（无 `/dev/en75xx-fxs0`），该页会显示无设备，属正常 |
 | USB | AN7583 在 OpenWrt 下暂不支持，驱动已编入，等上游修 |
 | 内核版本 | ponwrt master 为 `KERNEL_PATCHVER:=6.18`，与你原固件的 6.18.55 同系列 |
+| 与 Loong1996 那套固件的关系 | 引导层兼容（同布局同卷名同 FIT 格式）；但该项目的 master 分支**不带 PON 栈**（仅 `xpon-test` 实验分支有），所以本仓库仍以 ponwrt 为源码基础 |
