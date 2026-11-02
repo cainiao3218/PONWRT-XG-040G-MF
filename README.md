@@ -123,17 +123,60 @@ make -j$(nproc)
 2. 卷名一致 —— `fit` / `fip` / `ubootenv` / `ubootenv2` / `bosa` / `ri`；
 3. 镜像格式一致 —— 都是标准 FIT（kernel + fdt + rootfs），load 地址 `0x80200000`。
 
+### 当前设备状态（已确认）
+
+刷 U-Boot 时**已经勾过一次「重建 UBI」**，所以现在设备里的 `bosa` 与 `ri` 卷是空的：
+
+| 项 | 现状 | 后果 |
+|---|---|---|
+| `ri` 卷 | 空 | 网口 MAC 变成随机值（`02:xx:xx:xx:xx:xx`），部分运营商拒绝发 IP |
+| `bosa` 卷 | 空 | 光模块无校准数据，PON 无法上线或功率异常 |
+
+原始数据都在本地备份里（`mtd6_bosa.bin`、`mtd7_ri.bin`、`mtd16_all_flash.bin`），刷完固件按下面第 6 步写回即可。**这不是不可逆的损坏。**
+
 刷写步骤：
 
 1. 网线接 LAN 口，浏览器打开 Web-U-Boot 页面
 2. 左栏「**日常刷机**」里选 `...-nokia_xg-040g-mf-ubi-squashfs-sysupgrade.itb`
 3. 点「上传并刷写」
-4. **不要勾「重建 UBI」** —— UBI 已经挂得上，重建会连 `ri`（MAC）和 `bosa`（光模块校准）一起擦掉
+4. **不要勾「重建 UBI」** —— 已经重建过了，再建一次只会又擦一遍，没有任何好处
 5. 页面会核对文件名里的机型与 `/info` 的 model 是否一致，一致才显示绿框
-
-刷完后如发现 MAC 变成随机值，说明 `ri` 卷被覆盖了 —— 用网页救砖页的「按卷写入」把 `ri` 备份写回去即可，不影响开机。
+6. 刷完重启后，**立刻写回 `bosa` 和 `ri`**（见下节）
 
 > ⚠️ 网页 U-Boot 只接受 **`-ubi-squashfs-sysupgrade.itb`**，不要传 `-initramfs-recovery.itb`（那是内存救援系统，不能当系统刷）。
+
+### 刷完之后：写回 bosa 与 ri（必做）
+
+固件里已内置 `restore-pon-identity.sh`（`/usr/sbin/`），会自动补建缺失的卷、把容量对齐到 LEB 整数倍、写完回读比对 md5。
+
+```sh
+# 1. 传两个备份上去
+scp mtd6_bosa.bin mtd7_ri.bin root@192.168.1.1:/tmp/
+
+# 2. 登录后先看状态
+ssh root@192.168.1.1
+restore-pon-identity.sh --check
+#    bosa : 卷存在(/dev/ubi0_4, 372480 字节)，内容为空
+#    ri   : 卷存在(/dev/ubi0_5, 372480 字节)，内容为空
+
+# 3. 写入（脚本会逐个校验）
+restore-pon-identity.sh /tmp/mtd6_bosa.bin /tmp/mtd7_ri.bin
+
+# 4. 必须重启，驱动在启动时才读 bosa
+reboot
+```
+
+如果系统起不来、只能在网页 U-Boot 里操作，用救砖页的「**按卷写入**」分别写 `bosa` 和 `ri`，效果相同。
+
+### 刷机后的三项验证
+
+```sh
+ip link show br-lan        # MAC 必须是 E0:3D:A6:9E:B6:BF
+ponctl status              # 或 LuCI「ONU 状态」，看收发光功率是否在正常范围
+dmesg | grep -i "en7572\|pon"   # 光前端是否成功 probe
+```
+
+**光功率那一条不能跳过。** 能上网不代表校准读对了 —— 校准缺失的典型表现是「能注册但速率上不去」或「高峰期反复掉线」，而不是直接断网。
 
 
 ---
