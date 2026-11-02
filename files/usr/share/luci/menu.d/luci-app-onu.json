@@ -1,0 +1,65 @@
+{
+	"admin/onu": {
+		"title": "ONU",
+		"order": 20,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/onu/status": {
+		"title": "ONU Status",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "onu/status"
+		}
+	},
+	"admin/onu/hardware": {
+		"title": "ONU Hardware",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "onu/hardware"
+		}
+	},
+	"admin/onu/config": {
+		"title": "ONU Authentication",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "onu/config"
+		}
+	},
+	"admin/onu/internet": {
+		"title": "ONU Internet",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "onu/internet"
+		}
+	},
+	"admin/onu/iptv": {
+		"title": "ONU IPTV",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "onu/iptv"
+		}
+	},
+	"admin/onu/voice": {
+		"title": "ONU Voice",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "onu/voice"
+		}
+	},
+	"admin/onu/diagnostics": {
+		"title": "ONU Diagnostics",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "onu/diagnostics"
+		}
+	}
+}

@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: Apache-2.0
+
+START=19
+USE_PROCD=1
+
+start_service() {
+	# Boot ordering lets network and firewall consume the generated configuration.
+	/usr/libexec/iptv-apply boot
+}
+
+reload_service() {
+	/usr/libexec/iptv-apply reload
+}
+
+service_triggers() {
+	# The IPTV page owns rtp2httpd's upstream interface, so a change on either
+	# side has to re-derive the topology: also fire when rtp2httpd is edited.
+	procd_add_reload_trigger "onu-iptv"
+	procd_add_reload_trigger "rtp2httpd"
+}

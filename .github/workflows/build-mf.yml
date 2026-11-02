@@ -1,0 +1,123 @@
+name: Build OpenWrt for Nokia XG-040G-MF
+
+on:
+  workflow_dispatch:
+    inputs:
+      ponwrt_ref:
+        description: 'ponwrt 分支或提交'
+        required: false
+        default: 'master'
+      release_tag:
+        description: '打上此 tag 即发布到 Release（留空则只上传 artifact）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 清理磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm \
+            lrzsz mkisofs msmtp nano ninja-build p7zip-full patch pkgconf \
+            python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+
+      - name: 拉取 ponwrt 源码
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.ponwrt_ref || 'master' }}" \
+            https://github.com/pbs05/ponwrt.git openwrt
+          cd openwrt && git log -1 --oneline
+
+      - name: 更新 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成编译配置
+        run: |
+          cd openwrt
+          cp ../configs/an7583.config .config
+          cat ../configs/mf-extras.config >> .config
+          make defconfig
+          echo "==== 目标设备 ===="
+          grep -E '^CONFIG_TARGET_DEVICE_airoha' .config
+          echo "==== PON 相关包 ===="
+          grep -E '^CONFIG_PACKAGE_(kmod-)?(airoha|luci-app-pon|luci-app-iptv)' .config || true
+
+      - name: 植入 ONU 应用（从原厂 MD 固件导出）
+        run: |
+          mkdir -p openwrt/files
+          cp -a files/. openwrt/files/
+          echo "覆盖文件数：$(find openwrt/files -type f | wc -l)"
+
+      - name: 下载软件包源码
+        run: |
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+          find dl -size -1024c -delete
+
+      - name: 编译
+        run: |
+          cd openwrt
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: 汇总产物
+        run: |
+          cd openwrt/bin/targets/airoha/an7583
+          ls -lh
+          sha256sum * > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xg040g-mf-images
+          path: |
+            openwrt/bin/targets/airoha/an7583/*.itb
+            openwrt/bin/targets/airoha/an7583/*.bin
+            openwrt/bin/targets/airoha/an7583/*.fip
+            openwrt/bin/targets/airoha/an7583/SHA256SUMS.txt
+            openwrt/bin/targets/airoha/an7583/profiles.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布到 Release
+        if: github.event.inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: XG-040G-MF ${{ github.event.inputs.release_tag }}
+          body: |
+            基于 ponwrt `${{ github.event.inputs.ponwrt_ref }}` 编译，目标 an7583。
+            含 PON（EN7572）驱动与从原厂 MD 固件导出的 ONU/IPTV/语音管理界面。
+          files: |
+            openwrt/bin/targets/airoha/an7583/*.itb
+            openwrt/bin/targets/airoha/an7583/*.bin
+            openwrt/bin/targets/airoha/an7583/*.fip
+            openwrt/bin/targets/airoha/an7583/SHA256SUMS.txt

@@ -1,0 +1,1036 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+
+. /lib/functions.sh
+
+ACTION="${1:-reload}"
+NFT_FILE="/etc/iptv.nft"
+PROXY_INIT="/etc/init.d/omcproxy"
+UNICAST_INIT="/etc/init.d/rtp2httpd"
+
+# Gateway metric of every IPTV interface. The IPTV link shares the operator's
+# access network with the voice link, but the internet WAN owns the default
+# route: no IPTV interface may publish its own gateway as the default one, and
+# the high metric keeps everything this link does install behind the WAN.
+IPTV_METRIC='2000'
+
+# Managed section/device naming. UCI section names accept [A-Za-z0-9_] only
+# (no hyphens - uci rejects them), while kernel device names may carry them.
+#
+# Bridge (set-top box) mode = BR-IPTV. The kernel devices keep their
+# historical br-iptv / ct-iptv-* names because the nftables service filter
+# references them; only the UCI handles get readable names:
+BR_SVC_VLAN_SEC='br_iptv_svc_vlan'
+BR_MC_VLAN_SEC='br_iptv_mc_vlan'
+BR_IGMP_VLAN_SEC='br_iptv_igmp_vlan'
+BR_DEV_SEC='br_iptv_dev'
+BR_IFACE='br_iptv'
+BR_MC_IFACE='br_iptv_mc'
+BR_IGMP_IFACE='br_iptv_igmp'
+# Single cable (trunk) mode = MUX-IPTV. Per handed-over VLAN, named by its
+# 1-based position <n> in the handed-over list instead of by VLAN ID, so the
+# interface page never exposes operator VLAN numbers:
+#   sections: mux_up<n> / mux_dn<n> / mux_br<n>, interface mux_iptv_<n>
+#   devices:  mux-up<n> / mux-dn<n>, bridge br-mux-<n>
+# The VLAN ID stays only in the .vid option of the 8021q device section and in
+# onu-iptv's unicast_vlan; indices are re-derived on every apply and the whole
+# managed set is swept first, so list edits never leave stale sections.
+
+fail() {
+	logger -t iptv "$*"
+	echo "iptv: $*" >&2
+	exit 1
+}
+
+warn() {
+	logger -t iptv "$*"
+}
+
+validate_ifname() {
+	local name="$1"
+
+	[ -n "$name" ] || return 1
+	[ "${#name}" -le 15 ] || return 1
+
+	case "$name" in
+		*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+validate_vlan() {
+	local vid="$1"
+
+	case "$vid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ]
+}
+
+load_iptv_config() {
+	config_load onu-iptv
+	config_get_bool ENABLED config enabled 0
+	config_get MODE config mode bridge
+	config_get LAN_PORT config lan_port
+	config_get TRUNK_PORT config trunk_port
+	config_get TRUNK_VLANS config trunk_vlans
+	config_get UPLINK config uplink pon0
+	config_get SERVICE_VLAN config service_vlan
+	config_get MULTICAST_VLAN config multicast_vlan
+	config_get IGMP_VLAN config igmp_vlan
+	config_get_bool IGMP_SNOOPING config igmp_snooping 1
+	config_get_bool XPON_SNOOPING config xpon_snooping 0
+	config_get_bool XPON_FAST_LEAVE config xpon_fast_leave 0
+	config_get_bool XPON_MVLAN config xpon_mvlan 0
+	config_get XPON_MVLAN_LIST config xpon_mvlan_list
+	config_get_bool MLD_SNOOPING config mld_snooping 0
+	config_get_bool IGMP_PROXY config igmp_proxy 0
+	config_get_bool MLD_PROXY config mld_proxy 0
+	config_get_bool MULTICAST_QUERIER config multicast_querier 0
+	config_get_bool UNICAST config unicast 0
+	config_get UNICAST_PORT config unicast_port 5140
+	config_get UNICAST_ADDR config unicast_addr
+	config_get UNICAST_VLAN_OVERRIDE config unicast_vlan
+}
+
+# The internet page owns every port of its bridge in bridged mode; in the
+# dialled modes (PPPoE/DHCP) it owns no LAN port at all.
+load_internet_info() {
+	NET_ENABLED=0
+	NET_MODE='bridge'
+	NET_PORTS=''
+
+	config_load onu-internet
+	config_get_bool NET_ENABLED config enabled 0
+	[ "$NET_ENABLED" -eq 1 ] || return 0
+	config_get NET_MODE config mode bridge
+	config_get NET_PORTS config ports
+}
+
+# The voice page can own a dedicated bridge port or a tagged trunk port; the
+# port exclusivity checks and the VLAN uniqueness check both need these facts.
+load_voice_info() {
+	VOICE_ENABLED=0
+	VOICE_MODE='route'
+	VOICE_PORT=''
+	VOICE_TRUNK_PORT=''
+	VOICE_VLAN=''
+
+	config_load onu-voice
+	config_get_bool VOICE_ENABLED network enabled 0
+	[ "$VOICE_ENABLED" -eq 1 ] || return 0
+	config_get VOICE_MODE network mode route
+	config_get VOICE_PORT network lan_port
+	config_get VOICE_TRUNK_PORT network trunk_port
+	config_get VOICE_VLAN network vlan_id
+}
+
+# Same exclusivity matrix as check_port_conflict() in voice-apply: dedicated
+# bridge ports never share, a dedicated port never meets a trunk port, and the
+# IPTV and voice trunks may ride on one physical port on purpose.
+check_voice_port() {
+	local candidate="$1"
+
+	[ "$VOICE_ENABLED" -eq 1 ] || return 0
+	[ -n "$candidate" ] || return 0
+
+	if [ "$VOICE_MODE" = 'bridge' ]; then
+		[ "$candidate" != "$VOICE_PORT" ] ||
+			fail "LAN port $candidate is used by the voice bridge; free it on the voice page first"
+	else
+		[ "$MODE" != 'bridge' ] || [ "$candidate" != "$VOICE_TRUNK_PORT" ] ||
+			fail "LAN port $candidate is the voice trunk port; pick a different IPTV port"
+	fi
+}
+
+# Ports of the internet bridge are dedicated ports: they left br-lan and are
+# enslaved to br-wanup, so neither the IPTV set-top box port nor the IPTV trunk
+# port may take one. The internet page has no trunk of its own, so there is
+# nothing that could be shared with it on purpose.
+check_internet_port() {
+	local candidate="$1"
+	local port
+
+	[ -n "$candidate" ] || return 0
+	[ "$NET_ENABLED" -eq 1 ] || return 0
+	[ "$NET_MODE" = 'bridge' ] || return 0
+
+	for port in $NET_PORTS; do
+		[ "$candidate" != "$port" ] ||
+			fail "LAN port $candidate is used by the internet bridge; free it on the internet page first"
+	done
+}
+
+# True when the internet bridge owns the port. find_old_iptv_port() uses it so
+# a port the internet page took over is not handed back to br-lan behind its
+# back.
+internet_owns_port() {
+	local port
+
+	[ -n "$1" ] || return 1
+	[ "$NET_ENABLED" -eq 1 ] || return 1
+	[ "$NET_MODE" = 'bridge' ] || return 1
+
+	for port in $NET_PORTS; do
+		[ "$1" = "$port" ] && return 0
+	done
+
+	return 1
+}
+
+# A VLAN handed over by both pages would be bridged twice on (possibly) the
+# same wire; the voice VLAN must stay unique. In trunk mode every handed-over
+# VLAN counts, hence the check runs after resolve_trunk_vlans().
+check_voice_vlan() {
+	local vid
+
+	[ "$VOICE_ENABLED" -eq 1 ] || return 0
+	[ -n "$VOICE_VLAN" ] || return 0
+
+	if [ "$MODE" = 'trunk' ]; then
+		for vid in $TRUNK_VLAN_LIST; do
+			[ "$vid" != "$VOICE_VLAN" ] ||
+				fail "VLAN $vid already carries the voice service"
+		done
+	else
+		for vid in "$SERVICE_VLAN" "$MULTICAST_VLAN" "$IGMP_VLAN"; do
+			[ -n "$vid" ] || continue
+			[ "$vid" != "$VOICE_VLAN" ] ||
+				fail "VLAN $vid already carries the voice service"
+		done
+	fi
+}
+
+find_br_lan() {
+	local section="$1"
+	local name
+
+	config_get name "$section" name
+	[ "$name" = "br-lan" ] && BR_LAN_SECTION="$section"
+}
+
+find_old_iptv_port() {
+	local port
+	local ports
+
+	# Current name first, then the pre-rename luci_iptv_bridge of older builds,
+	# so upgrading restores the STB port back into br-lan on the first apply.
+	config_get ports "$BR_DEV_SEC" ports
+	[ -z "$ports" ] && config_get ports luci_iptv_bridge ports
+	for port in $ports; do
+		case "$port" in
+			ct-iptv-svc|ct-iptv-mc|ct-iptv-igmp) continue ;;
+		esac
+		# A port the internet bridge took over is not ours to hand back.
+		internet_owns_port "$port" && continue
+		OLD_LAN_PORT="$port"
+	done
+}
+
+detach_from_device() {
+	local section="$1"
+	local ports port
+
+	config_get ports "$section" ports
+	for port in $ports; do
+		[ "$port" = "$LAN_PORT" ] && uci -q del_list "network.$section.ports=$port"
+	done
+}
+
+detach_from_interface() {
+	local section="$1"
+	local device ifnames ifname
+
+	case "$section" in
+		br_iptv|br_iptv_mc|br_iptv_igmp|mux_iptv_*|\
+		luci_iptv|luci_iptv_mc|luci_iptv_igmp|luci_iptv_v*|\
+		voice|voice_*|luci_voice*) return ;;
+	esac
+
+	config_get device "$section" device
+	config_get ifnames "$section" ifname
+	[ "$device" = "$LAN_PORT" ] && uci -q delete "network.$section.device"
+
+	for ifname in $ifnames; do
+		[ "$ifname" = "$LAN_PORT" ] || continue
+		uci -q del_list "network.$section.ifname=$ifname" || uci -q delete "network.$section.ifname"
+	done
+}
+
+detach_from_bridge_vlan() {
+	local section="$1"
+	local ports token base
+
+	config_get ports "$section" ports
+	for token in $ports; do
+		base="${token%%:*}"
+		[ "$base" = "$LAN_PORT" ] && uci -q del_list "network.$section.ports=$token"
+	done
+}
+
+# Single cable mode hands the VLANs over tagged, so it never owns a LAN port.
+detach_lan_port() {
+	[ "$MODE" = 'bridge' ] || return 0
+	[ -n "$LAN_PORT" ] || return 0
+
+	config_foreach detach_from_device device
+	config_foreach detach_from_interface interface
+	config_foreach detach_from_bridge_vlan bridge-vlan
+	remove_selected_port_from_br_lan
+}
+
+validate_config() {
+	[ "$ENABLED" -eq 1 ] || return 0
+
+	validate_ifname "$UPLINK" || fail "Invalid uplink device name"
+	[ -e "/sys/class/net/$UPLINK" ] || fail "Uplink device $UPLINK was not found"
+	validate_vlan "$SERVICE_VLAN" || fail "Service VLAN must be between 1 and 4094"
+
+	if [ -n "$MULTICAST_VLAN" ]; then
+		validate_vlan "$MULTICAST_VLAN" || fail "Multicast VLAN must be between 1 and 4094"
+		[ "$MULTICAST_VLAN" != "$SERVICE_VLAN" ] || fail "Leave the multicast VLAN empty when it matches the service VLAN"
+	fi
+	[ -z "$IGMP_VLAN" ] || validate_vlan "$IGMP_VLAN" || fail "IGMP upstream VLAN must be between 1 and 4094"
+
+	if [ "$MODE" = 'bridge' ]; then
+		validate_ifname "$LAN_PORT" || fail "Invalid LAN port name"
+		[ "$LAN_PORT" != "$UPLINK" ] || fail "The LAN port and uplink must be different devices"
+		[ -e "/sys/class/net/$LAN_PORT" ] || fail "LAN port $LAN_PORT was not found"
+		check_internet_port "$LAN_PORT"
+		check_voice_port "$LAN_PORT"
+	else
+		validate_ifname "$TRUNK_PORT" || fail "Invalid trunk port name"
+		[ "$TRUNK_PORT" != "$UPLINK" ] || fail "The trunk port and uplink must be different devices"
+		[ -e "/sys/class/net/$TRUNK_PORT" ] || fail "Trunk port $TRUNK_PORT was not found"
+		check_internet_port "$TRUNK_PORT"
+		check_voice_port "$TRUNK_PORT"
+	fi
+}
+
+# An empty list falls back to the VLANs configured on the other tabs, so the
+# single cable mode works without repeating them.
+resolve_trunk_vlans() {
+	local vid seen
+
+	TRUNK_VLAN_LIST=''
+	[ "$MODE" = 'trunk' ] || return 0
+
+	if [ -z "$TRUNK_VLANS" ]; then
+		TRUNK_VLANS="$SERVICE_VLAN"
+		[ -n "$MULTICAST_VLAN" ] && TRUNK_VLANS="$TRUNK_VLANS $MULTICAST_VLAN"
+		if [ -n "$IGMP_VLAN" ] && [ "$IGMP_VLAN" != "$SERVICE_VLAN" ] && [ "$IGMP_VLAN" != "$MULTICAST_VLAN" ]; then
+			TRUNK_VLANS="$TRUNK_VLANS $IGMP_VLAN"
+		fi
+	fi
+
+	for vid in $TRUNK_VLANS; do
+		validate_vlan "$vid" || fail "VLAN $vid must be between 1 and 4094"
+		for seen in $TRUNK_VLAN_LIST; do
+			[ "$seen" = "$vid" ] && continue 2
+		done
+		TRUNK_VLAN_LIST="${TRUNK_VLAN_LIST:+$TRUNK_VLAN_LIST }$vid"
+	done
+
+	[ -n "$TRUNK_VLAN_LIST" ] || fail "The trunk needs at least one VLAN"
+}
+
+# 1-based position of a VLAN ID in the handed-over list, used to derive the
+# VLAN-free mux-* names. Empty when the VLAN is not handed over.
+mux_index_of_vid() {
+	local want="$1"
+	local vid idx=0
+
+	for vid in $TRUNK_VLAN_LIST; do
+		idx=$((idx + 1))
+		[ "$vid" = "$want" ] && { echo "$idx"; return 0; }
+	done
+
+	return 1
+}
+
+resolve_igmp_port() {
+	IGMP_PORT='ct-iptv-svc'
+	[ -n "$MULTICAST_VLAN" ] && IGMP_PORT='ct-iptv-mc'
+
+	[ -n "$IGMP_VLAN" ] || return
+	if [ "$IGMP_VLAN" = "$SERVICE_VLAN" ]; then
+		IGMP_PORT='ct-iptv-svc'
+	elif [ -n "$MULTICAST_VLAN" ] && [ "$IGMP_VLAN" = "$MULTICAST_VLAN" ]; then
+		IGMP_PORT='ct-iptv-mc'
+	else
+		IGMP_PORT='ct-iptv-igmp'
+	fi
+}
+
+# The multicast proxy terminates the multicast VLAN instead of bridging it, so
+# it needs an upstream device that is not a member of br-iptv. Without a
+# separate multicast or IGMP VLAN there is nothing left to terminate and the
+# configuration falls back to transparent bridging.
+resolve_proxy() {
+	PROXY_ACTIVE=0
+	PROXY_UPLINK_DEV=''
+	PROXY_UPLINK_IFACE=''
+
+	[ "$ENABLED" -eq 1 ] || return 0
+
+	if [ "$MODE" = 'trunk' ]; then
+		[ "$IGMP_PROXY" -eq 1 ] || [ "$MLD_PROXY" -eq 1 ] || return 0
+		warn "The multicast proxy cannot run in single cable mode; the VLANs are handed over unmodified"
+		return 0
+	fi
+
+	[ "$IGMP_PROXY" -eq 1 ] || [ "$MLD_PROXY" -eq 1 ] || return 0
+
+	if [ -n "$IGMP_VLAN" ] && [ "$IGMP_VLAN" != "$SERVICE_VLAN" ] && [ "$IGMP_VLAN" != "$MULTICAST_VLAN" ]; then
+		PROXY_UPLINK_DEV='ct-iptv-igmp'
+		PROXY_UPLINK_IFACE="$BR_IGMP_IFACE"
+	elif [ -n "$MULTICAST_VLAN" ]; then
+		PROXY_UPLINK_DEV='ct-iptv-mc'
+		PROXY_UPLINK_IFACE="$BR_MC_IFACE"
+		if [ "$IGMP_PORT" = 'ct-iptv-svc' ]; then
+			warn "IGMP upstream VLAN follows the service VLAN; the proxy uses the multicast VLAN instead"
+		fi
+	else
+		warn "The multicast proxy needs a separate multicast or IGMP upstream VLAN; keeping the bridge transparent"
+		return 0
+	fi
+
+	[ -x "$PROXY_INIT" ] || warn "omcproxy is not installed; the proxy configuration is stored but not started"
+
+	PROXY_ACTIVE=1
+}
+
+# The Linux bridge has a single multicast_snooping switch covering both IGMP
+# and MLD, so either family enables it for both.
+resolve_snooping() {
+	SNOOPING=0
+	[ "$IGMP_SNOOPING" -eq 1 ] && SNOOPING=1
+	[ "$MLD_SNOOPING" -eq 1 ] && SNOOPING=1
+
+	if [ "$SNOOPING" -eq 1 ] && [ "$MULTICAST_QUERIER" -ne 1 ]; then
+		warn "Multicast snooping is on without a querier; group memberships time out and the stream may stop"
+	fi
+
+	if [ "$MULTICAST_QUERIER" -eq 1 ] && [ "$PROXY_ACTIVE" -eq 1 ]; then
+		warn "The multicast proxy owns the querier role; the querier setting is ignored while the proxy runs"
+	fi
+}
+
+# Single cable mode builds one bridge per handed-over VLAN, so the relay can be
+# pointed at a VLAN of its own instead of following the multicast VLAN. Only the
+# VLANs actually handed over on the trunk get a bridge, so the override is
+# checked against the trunk list rather than trusted: a relay bound to a bridge
+# that does not exist never receives a single packet.
+#
+# Outside single cable mode there is no per-VLAN bridge to pick from, so the
+# setting cannot apply. It is ignored with a warning instead of failing the
+# apply: the value stays valid for whenever the mode is switched back.
+resolve_unicast_vlan() {
+	local vid
+
+	[ -n "$UNICAST_VLAN_OVERRIDE" ] || return 0
+
+	if [ "$MODE" != 'trunk' ]; then
+		warn "unicast_vlan needs single cable mode; the relay VLAN follows the bridge"
+		UNICAST_VLAN_OVERRIDE=''
+		return 0
+	fi
+
+	validate_vlan "$UNICAST_VLAN_OVERRIDE" ||
+		fail "unicast_vlan must be a VLAN ID between 1 and 4094"
+
+	for vid in $TRUNK_VLAN_LIST; do
+		[ "$vid" = "$UNICAST_VLAN_OVERRIDE" ] && return 0
+	done
+
+	fail "VLAN $UNICAST_VLAN_OVERRIDE is not handed over on the trunk; add it to the handed over VLANs or clear unicast_vlan"
+}
+
+# The relay has to listen on a bridge, never on one of its member ports: frames
+# reaching a bridge port are handled by the bridge and never hit the local
+# stack on that port.
+#
+# Relay VLAN resolution in single cable mode, in order:
+#   1. explicit unicast_vlan (validated by resolve_unicast_vlan() to be one of
+#      the handed-over VLANs);
+#   2. the multicast VLAN, when it is handed over;
+#   3. the service VLAN, when it is handed over;
+#   4. the first handed-over VLAN (only reachable with a custom trunk list
+#      that excludes both defaults), with a warning.
+# Steps 2/3 must be checked against the trunk list: only handed-over VLANs get
+# a br-mux-<n> bridge, so binding anything else would leave the relay deaf.
+resolve_relay_vlan() {
+	local cand vid
+
+	[ "$MODE" = 'trunk' ] || return 0
+
+	UNICAST_VLAN="$UNICAST_VLAN_OVERRIDE"
+	[ -n "$UNICAST_VLAN" ] && return 0
+
+	for cand in "$MULTICAST_VLAN" "$SERVICE_VLAN"; do
+		[ -n "$cand" ] || continue
+		for vid in $TRUNK_VLAN_LIST; do
+			if [ "$vid" = "$cand" ]; then
+				UNICAST_VLAN="$cand"
+				return 0
+			fi
+		done
+		warn "Relay VLAN default '$cand' is not handed over on the trunk"
+	done
+
+	# TRUNK_VLAN_LIST is guaranteed non-empty by resolve_trunk_vlans().
+	UNICAST_VLAN="${TRUNK_VLAN_LIST%% *}"
+	warn "Neither the multicast nor the service VLAN is handed over; the relay listens on VLAN $UNICAST_VLAN instead"
+}
+
+resolve_unicast() {
+	UNICAST_ACTIVE=0
+	UNICAST_DEV=''
+	UNICAST_IFACE=''
+	UNICAST_VLAN=''
+
+	[ "$ENABLED" -eq 1 ] || return 0
+	[ "$UNICAST" -eq 1 ] || return 0
+
+	resolve_unicast_vlan
+
+	if [ "$MODE" = 'trunk' ]; then
+		local mux_idx
+
+		resolve_relay_vlan
+		mux_idx="$(mux_index_of_vid "$UNICAST_VLAN")" ||
+			fail "Relay VLAN $UNICAST_VLAN has no mux bridge"
+		UNICAST_DEV="br-mux-$mux_idx"
+		UNICAST_IFACE="mux_iptv_$mux_idx"
+	elif [ "$PROXY_ACTIVE" -eq 1 ]; then
+		UNICAST_DEV="$PROXY_UPLINK_DEV"
+		UNICAST_IFACE="$PROXY_UPLINK_IFACE"
+	else
+		UNICAST_DEV='br-iptv'
+		UNICAST_IFACE="$BR_IFACE"
+	fi
+
+	[ -n "$UNICAST_PORT" ] || UNICAST_PORT='5140'
+	[ -x "$UNICAST_INIT" ] || warn "rtp2httpd is not installed; the relay settings are stored but not started"
+
+	if [ -z "$UNICAST_ADDR" ]; then
+		warn "The relay has no address on $UNICAST_DEV; without one the ONU cannot join the multicast groups itself"
+	fi
+
+	UNICAST_ACTIVE=1
+}
+
+write_nft_rules() {
+	local tmp
+
+	tmp="$(mktemp /etc/iptv.nft.XXXXXX)" || fail "Cannot create nftables staging file"
+
+	if [ "$ENABLED" -ne 1 ]; then
+		cat >"$tmp" <<'EOF'
+# IPTV bridge inactive.
+EOF
+	elif [ "$MODE" = 'trunk' ]; then
+		# One bridge per VLAN already isolates the services, there is nothing
+		# left to filter between them.
+		cat >"$tmp" <<'EOF'
+# Single cable mode: every VLAN got its own bridge, no service filter needed.
+EOF
+	else
+		cat >"$tmp" <<EOF
+# Flush the table so repeated firewall reloads use the current rules.
+table bridge iptv
+flush table bridge iptv
+
+table bridge iptv {
+	chain iptv_forward {
+		# The service VLAN carries two-way STB signaling and unicast traffic.
+		iifname "$LAN_PORT" oifname "ct-iptv-svc" counter accept
+		iifname "ct-iptv-svc" oifname "$LAN_PORT" counter accept
+EOF
+		if [ "$PROXY_ACTIVE" -eq 0 ] && [ -n "$MULTICAST_VLAN" ]; then
+			cat >>"$tmp" <<EOF
+		# The multicast VLAN carries downstream IPv4 multicast to the STB.
+		iifname "ct-iptv-mc" oifname "$LAN_PORT" \
+			ether type ip ip daddr 224.0.0.0/4 counter accept
+		iifname "ct-iptv-svc" oifname "ct-iptv-mc" \
+			counter drop comment "block-service-to-multicast"
+		iifname "ct-iptv-mc" oifname "ct-iptv-svc" \
+			counter drop comment "block-multicast-to-service"
+EOF
+		fi
+		if [ "$PROXY_ACTIVE" -eq 0 ] && [ "$IGMP_PORT" != 'ct-iptv-svc' ]; then
+			cat >>"$tmp" <<EOF
+		# IGMP Join/Leave follows the OLT-selected upstream VLAN and its GEM.
+		iifname "$LAN_PORT" oifname "$IGMP_PORT" \
+			ether type ip ip protocol igmp counter accept comment "allow-stb-igmp"
+		iifname "$LAN_PORT" oifname "$IGMP_PORT" \
+			counter drop comment "block-stb-data-to-igmp-vlan"
+EOF
+		fi
+
+		cat >>"$tmp" <<'EOF'
+		counter drop comment "drop-other-iptv-bridge-traffic"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+
+		# The bridge hook sees every bridge; this match scopes the service filter.
+		meta ibrname "br-iptv" jump iptv_forward
+	}
+}
+EOF
+	fi
+
+	if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+		rm -f "$tmp"
+		fail "Generated nftables rules failed validation"
+	fi
+
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$NFT_FILE"
+}
+
+restore_old_lan_port() {
+	[ -n "$OLD_LAN_PORT" ] || return
+	[ -n "$BR_LAN_SECTION" ] || return
+
+	uci -q del_list "network.$BR_LAN_SECTION.ports=$OLD_LAN_PORT"
+	uci -q add_list "network.$BR_LAN_SECTION.ports=$OLD_LAN_PORT"
+}
+
+remove_selected_port_from_br_lan() {
+	[ -n "$BR_LAN_SECTION" ] || return
+	uci -q del_list "network.$BR_LAN_SECTION.ports=$LAN_PORT"
+}
+
+# Every managed section is prefixed, so a single sweep drops both the current
+# br_iptv* / mux_* sections and the per VLAN sections of a previous single
+# cable configuration. The luci_iptv* prefix is the pre-rename namespace and is
+# swept as well, so an upgrade leaves no duplicates behind.
+remove_managed_network() {
+	local section
+
+	for section in $(uci -q show network 2>/dev/null | \
+		sed -n 's/^network\.\([A-Za-z0-9_]*\)=.*/\1/p' | sort -u); do
+		case "$section" in
+			luci_iptv*|br_iptv*|\
+			mux_up[0-9]*|mux_dn[0-9]*|mux_br[0-9]*|mux_iptv_[0-9]*)
+				uci -q delete "network.$section"
+				;;
+		esac
+	done
+}
+
+prefix_to_netmask() {
+	local prefix="$1"
+	local full part i octet mask=''
+
+	full=$(( prefix / 8 ))
+	part=$(( prefix % 8 ))
+
+	for i in 0 1 2 3; do
+		if [ "$i" -lt "$full" ]; then
+			octet=255
+		elif [ "$i" -eq "$full" ]; then
+			octet=$(( 256 - (1 << (8 - part)) ))
+		else
+			octet=0
+		fi
+		mask="${mask:+$mask.}$octet"
+	done
+
+	printf '%s' "$mask"
+}
+
+# The relay needs an address to join the groups itself; without one the bridge
+# stays unaddressed and the relay has to rely on the interface index.
+configure_interface_address() {
+	local section="$1"
+	local device="$2"
+	local ip mask prefix
+
+	uci set "network.$section.auto"='1'
+	uci set "network.$section.delegate"='0'
+	# defaultroute=0 keeps the interface gateway out of the default route, and
+	# the high metric deprioritises every route this link does install: the
+	# internet WAN must stay the default path even when the relay address makes
+	# the IPTV link look like a routed uplink.
+	uci set "network.$section.defaultroute"='0'
+	uci set "network.$section.metric"="$IPTV_METRIC"
+
+	if [ "$UNICAST_ACTIVE" -eq 1 ] && [ "$UNICAST_DEV" = "$device" ] && [ -n "$UNICAST_ADDR" ]; then
+		ip="${UNICAST_ADDR%%/*}"
+		prefix="${UNICAST_ADDR#*/}"
+		if [ "$prefix" = "$UNICAST_ADDR" ]; then
+			mask='255.255.255.0'
+		elif [ "$prefix" -ge 0 ] && [ "$prefix" -le 32 ]; then
+			mask="$(prefix_to_netmask "$prefix")"
+		else
+			fail "The relay address needs a prefix length between 0 and 32"
+		fi
+
+		uci set "network.$section.proto"='static'
+		uci set "network.$section.ipaddr"="$ip"
+		uci set "network.$section.netmask"="$mask"
+	else
+		uci set "network.$section.proto"='none'
+	fi
+}
+
+write_trunk_network() {
+	local vid idx=0
+
+	for vid in $TRUNK_VLAN_LIST; do
+		idx=$((idx + 1))
+
+		uci set "network.mux_up$idx"='device'
+		uci set "network.mux_up$idx.type"='8021q'
+		uci set "network.mux_up$idx.ifname"="$UPLINK"
+		uci set "network.mux_up$idx.vid"="$vid"
+		uci set "network.mux_up$idx.name"="mux-up$idx"
+
+		uci set "network.mux_dn$idx"='device'
+		uci set "network.mux_dn$idx.type"='8021q'
+		uci set "network.mux_dn$idx.ifname"="$TRUNK_PORT"
+		uci set "network.mux_dn$idx.vid"="$vid"
+		uci set "network.mux_dn$idx.name"="mux-dn$idx"
+
+		uci set "network.mux_br$idx"='device'
+		uci set "network.mux_br$idx.type"='bridge'
+		uci set "network.mux_br$idx.name"="br-mux-$idx"
+		uci set "network.mux_br$idx.stp"='0'
+		uci set "network.mux_br$idx.igmp_snooping"="$SNOOPING"
+		uci set "network.mux_br$idx.multicast_querier"="$MULTICAST_QUERIER"
+		uci add_list "network.mux_br$idx.ports"="mux-up$idx"
+		uci add_list "network.mux_br$idx.ports"="mux-dn$idx"
+
+		uci set "network.mux_iptv_$idx"='interface'
+		uci set "network.mux_iptv_$idx.device"="br-mux-$idx"
+		configure_interface_address "mux_iptv_$idx" "br-mux-$idx"
+	done
+}
+
+write_bridge_network() {
+	uci set "network.$BR_SVC_VLAN_SEC"='device'
+	uci set "network.$BR_SVC_VLAN_SEC.type"='8021q'
+	uci set "network.$BR_SVC_VLAN_SEC.ifname"="$UPLINK"
+	uci set "network.$BR_SVC_VLAN_SEC.vid"="$SERVICE_VLAN"
+	uci set "network.$BR_SVC_VLAN_SEC.name"='ct-iptv-svc'
+
+	if [ -n "$MULTICAST_VLAN" ]; then
+		uci set "network.$BR_MC_VLAN_SEC"='device'
+		uci set "network.$BR_MC_VLAN_SEC.type"='8021q'
+		uci set "network.$BR_MC_VLAN_SEC.ifname"="$UPLINK"
+		uci set "network.$BR_MC_VLAN_SEC.vid"="$MULTICAST_VLAN"
+		uci set "network.$BR_MC_VLAN_SEC.name"='ct-iptv-mc'
+	fi
+
+	if [ "$IGMP_PORT" = 'ct-iptv-igmp' ]; then
+		uci set "network.$BR_IGMP_VLAN_SEC"='device'
+		uci set "network.$BR_IGMP_VLAN_SEC.type"='8021q'
+		uci set "network.$BR_IGMP_VLAN_SEC.ifname"="$UPLINK"
+		uci set "network.$BR_IGMP_VLAN_SEC.vid"="$IGMP_VLAN"
+		uci set "network.$BR_IGMP_VLAN_SEC.name"='ct-iptv-igmp'
+	fi
+
+	uci set "network.$BR_DEV_SEC"='device'
+	uci set "network.$BR_DEV_SEC.type"='bridge'
+	uci set "network.$BR_DEV_SEC.name"='br-iptv'
+	uci set "network.$BR_DEV_SEC.stp"='0'
+	# The service filter controls multicast forwarding for this bridge.
+	uci set "network.$BR_DEV_SEC.igmp_snooping"="$SNOOPING"
+	uci set "network.$BR_DEV_SEC.multicast_querier"="$MULTICAST_QUERIER"
+	uci add_list "network.$BR_DEV_SEC.ports"="$LAN_PORT"
+	uci add_list "network.$BR_DEV_SEC.ports"='ct-iptv-svc'
+	if [ "$PROXY_ACTIVE" -eq 0 ]; then
+		[ -n "$MULTICAST_VLAN" ] && uci add_list "network.$BR_DEV_SEC.ports"='ct-iptv-mc'
+		[ "$IGMP_PORT" = 'ct-iptv-igmp' ] && uci add_list "network.$BR_DEV_SEC.ports"='ct-iptv-igmp'
+	fi
+
+	uci set "network.$BR_IFACE"='interface'
+	uci set "network.$BR_IFACE.device"='br-iptv'
+	configure_interface_address "$BR_IFACE" 'br-iptv'
+
+	if [ "$PROXY_ACTIVE" -eq 1 ]; then
+		# The proxy terminates the multicast VLANs, so they get their own
+		# interfaces instead of joining the STB bridge.
+		if [ -n "$MULTICAST_VLAN" ]; then
+			uci set "network.$BR_MC_IFACE"='interface'
+			uci set "network.$BR_MC_IFACE.device"='ct-iptv-mc'
+			configure_interface_address "$BR_MC_IFACE" 'ct-iptv-mc'
+		fi
+
+		if [ "$IGMP_PORT" = 'ct-iptv-igmp' ]; then
+			uci set "network.$BR_IGMP_IFACE"='interface'
+			uci set "network.$BR_IGMP_IFACE.device"='ct-iptv-igmp'
+			configure_interface_address "$BR_IGMP_IFACE" 'ct-iptv-igmp'
+		fi
+	fi
+}
+
+write_network_config() {
+	restore_old_lan_port
+	remove_managed_network
+
+	if [ "$ENABLED" -eq 1 ]; then
+		# A dedicated STB port needs exclusive netifd ownership.
+		detach_lan_port
+
+		if [ "$MODE" = 'trunk' ]; then
+			write_trunk_network
+		else
+			write_bridge_network
+		fi
+	fi
+
+	uci commit network || fail "Cannot save network configuration"
+}
+
+write_proxy_config() {
+	# omcproxy proxies IGMPv3 and MLDv2 as one instance, so a single section
+	# serves both families. Uplink and downlink are logical interface names.
+	uci -q delete omcproxy.iptv
+	uci -q delete omcproxy.luci_iptv
+
+	if [ "$PROXY_ACTIVE" -eq 1 ]; then
+		uci set omcproxy.iptv='proxy'
+		uci set omcproxy.iptv.scope='global'
+		uci set omcproxy.iptv.uplink="$PROXY_UPLINK_IFACE"
+		uci add_list omcproxy.iptv.downlink="$BR_IFACE"
+	fi
+
+	uci commit omcproxy || fail "Cannot save multicast proxy configuration"
+}
+
+# Proxied multicast is routed by the kernel and therefore hits the forward
+# hook; both sides have to sit in one permissive zone.
+write_proxy_firewall_zone() {
+	uci -q delete firewall.iptv_zone
+	uci -q delete firewall.luci_iptv_zone
+
+	if [ "$PROXY_ACTIVE" -eq 1 ]; then
+		uci set firewall.iptv_zone='zone'
+		uci set firewall.iptv_zone.name='iptv'
+		uci set firewall.iptv_zone.input='ACCEPT'
+		uci set firewall.iptv_zone.output='ACCEPT'
+		uci set firewall.iptv_zone.forward='ACCEPT'
+		# Downstream side first, then every upstream subinterface: the multicast
+		# data may arrive on the multicast VLAN even when IGMP leaves on its own.
+		uci add_list firewall.iptv_zone.network="$BR_IFACE"
+		[ -n "$MULTICAST_VLAN" ] && uci add_list firewall.iptv_zone.network="$BR_MC_IFACE"
+		[ "$IGMP_PORT" = 'ct-iptv-igmp' ] && uci add_list firewall.iptv_zone.network="$BR_IGMP_IFACE"
+	fi
+
+	uci commit firewall || fail "Cannot save firewall configuration"
+}
+
+# The relay gets a zone of its own: an interface without one is dropped by
+# firewall4, so the ONU would never receive the multicast it joined. It only
+# consumes the streams locally, hence input ACCEPT but no forwarding - unlike
+# the proxy zone, which has to let the kernel route multicast between sides.
+write_unicast_firewall_zone() {
+	uci -q delete firewall.iptv_relay_zone
+	uci -q delete firewall.luci_iptv_relay_zone
+
+	RELAY_ZONE=0
+	[ "$UNICAST_ACTIVE" -eq 1 ] && RELAY_ZONE=1
+
+	# With a proxy running the relay listens on the proxy uplink, and the iptv
+	# zone already covers it. An interface must not sit in two zones.
+	if [ "$PROXY_ACTIVE" -eq 1 ]; then
+		case "$UNICAST_IFACE" in
+			"$BR_IFACE"|"$BR_MC_IFACE"|"$BR_IGMP_IFACE") RELAY_ZONE=0 ;;
+		esac
+	fi
+
+	if [ "$RELAY_ZONE" -eq 1 ]; then
+		uci set firewall.iptv_relay_zone='zone'
+		uci set firewall.iptv_relay_zone.name='iptv_relay'
+		uci set firewall.iptv_relay_zone.input='ACCEPT'
+		uci set firewall.iptv_relay_zone.output='ACCEPT'
+		uci set firewall.iptv_relay_zone.forward='REJECT'
+		uci add_list firewall.iptv_relay_zone.network="$UNICAST_IFACE"
+	fi
+
+	uci commit firewall || fail "Cannot save firewall configuration"
+}
+
+write_firewall_config() {
+	uci -q delete firewall.luci_iptv
+	uci set firewall.iptv_filter='include'
+	uci set firewall.iptv_filter.type='nftables'
+	uci set firewall.iptv_filter.position='ruleset-append'
+	uci set firewall.iptv_filter.path="$NFT_FILE"
+	uci set firewall.iptv_filter.enabled="$ENABLED"
+	uci commit firewall || fail "Cannot save firewall configuration"
+}
+
+# Only the fields owned by this page are written: whether the daemon runs and
+# which device it listens on. The listen sockets (hence the port), playlist,
+# FCC and worker tuning stay on the rtp2httpd page.
+#
+# Current builds ship one anonymous "config instance" section with an
+# "enabled" flag; older builds used a named section carrying "disabled".
+# uci show prints anonymous sections as @instance[0], whose brackets require
+# the broad [^.=]* capture.
+write_unicast_config() {
+	local section type
+
+	[ -x "$UNICAST_INIT" ] || return 0
+
+	section="$(uci -q show rtp2httpd 2>/dev/null | \
+		sed -n "s/^rtp2httpd\.\([^.=]*\)='\?instance'\?$/\1/p" | head -n 1)"
+	if [ -z "$section" ]; then
+		section="$(uci -q show rtp2httpd 2>/dev/null | \
+			sed -n "s/^rtp2httpd\.\([^.=]*\)='\?rtp2httpd'\?$/\1/p" | head -n 1)"
+	fi
+	if [ -z "$section" ]; then
+		section='iptv'
+		uci set "rtp2httpd.$section"='instance'
+		uci add_list "rtp2httpd.$section.listen"='0.0.0.0:5140'
+		uci add_list "rtp2httpd.$section.listen"='[::]:5140'
+	fi
+	type="$(uci -q get "rtp2httpd.$section")"
+
+	if [ "$UNICAST_ACTIVE" -eq 1 ]; then
+		uci set "rtp2httpd.$section.upstream_interface"="$UNICAST_DEV"
+		if [ "$type" = 'instance' ]; then
+			uci set "rtp2httpd.$section.enabled"='1'
+		else
+			uci set "rtp2httpd.$section.disabled"='0'
+		fi
+	else
+		if [ "$type" = 'instance' ]; then
+			uci set "rtp2httpd.$section.enabled"='0'
+		else
+			uci set "rtp2httpd.$section.disabled"='1'
+		fi
+		# This page owns the upstream selection, so it takes it with it.
+		uci -q delete "rtp2httpd.$section.upstream_interface"
+	fi
+
+	uci commit rtp2httpd || fail "Cannot save multicast to unicast configuration"
+}
+
+restart_daemon() {
+	local init="$1"
+	local active="$2"
+
+	[ -x "$init" ] || return 0
+	[ "$ACTION" = "boot" ] && return 0
+
+	if [ "$active" -eq 1 ]; then
+		"$init" enable
+		"$init" restart || warn "$init restart failed"
+	else
+		"$init" stop >/dev/null 2>&1
+		"$init" disable
+	fi
+}
+
+reload_runtime() {
+	[ "$ACTION" = "boot" ] && return 0
+
+	if [ "$ENABLED" -eq 1 ]; then
+		# The bridge must be filtered from its first forwarded frame.
+		/etc/init.d/firewall reload || fail "firewall4 reload failed"
+		ubus call network reload >/dev/null || fail "netifd reload failed"
+	else
+		# The filter remains active throughout bridge teardown.
+		ubus call network reload >/dev/null || fail "netifd reload failed"
+		if nft list table bridge iptv >/dev/null 2>&1; then
+			nft delete table bridge iptv || fail "Cannot delete IPTV filter table"
+		fi
+		/etc/init.d/firewall reload || fail "firewall4 reload failed"
+	fi
+
+	restart_daemon "$PROXY_INIT" "$PROXY_ACTIVE"
+	restart_daemon "$UNICAST_INIT" "$UNICAST_ACTIVE"
+
+	# PON MAC-level IGMP/MLD snooping (kmod-airoha-xpon netfilter hook + PPE
+	# multicast flow).  Runs in parallel with bridge snooping; does not steal
+	# IGMP reports from the proxy (hook returns NF_ACCEPT).
+	if [ -x /usr/sbin/airoha-ponctl ]; then
+		if [ "$ENABLED" -eq 1 ] && [ "$XPON_SNOOPING" -eq 1 ]; then
+			airoha-ponctl igmp set --enable 1 --snooping 1 \
+				$([ "$MLD_SNOOPING" -eq 1 ] && echo '--mld 1') \
+				$([ "$XPON_FAST_LEAVE" -eq 1 ] && echo '--fast-leave 1') \
+				$([ "$XPON_MVLAN" -eq 1 ] && echo '--mvlan 1') \
+				>/dev/null 2>&1 || warn "PON IGMP snooping enable failed"
+			apply_mvlan_entries
+		else
+			airoha-ponctl igmp set --enable 0 >/dev/null 2>&1 || true
+		fi
+	fi
+}
+
+# The MVLAN table is a plain list, so a change is a replacement, not a patch.
+# Everything goes out as one atomic commit: the kernel fills the table and
+# only then raises the enable flag, so no window exists where the flag is on
+# but the table is still empty (which would let every VLAN through) or the
+# table is filled but the flag is off (no filter at all).
+#
+# Sending the list also covers the delete side, which a naive "add the
+# configured vids" loop would miss: a VLAN the operator removed from the UI
+# would otherwise keep passing multicast.
+#
+# VID 0 is legal and meaningful: an enabled multicast proxy terminates the
+# multicast VLAN and hands the groups to the LAN untagged, which the driver
+# reports as VID 0. When the proxy runs and the operator listed no VLAN, that
+# untagged delivery is what the whitelist has to allow, so 0 is filled in
+# rather than left to fail the filter closed.
+apply_mvlan_entries() {
+	local vids=""
+	local vid
+
+	if [ "$XPON_MVLAN" -eq 1 ]; then
+		vids="$XPON_MVLAN_LIST"
+
+		if [ -z "$vids" ] && { [ "$IGMP_PROXY" -eq 1 ] || [ "$MLD_PROXY" -eq 1 ]; }; then
+			vids='0'
+		fi
+
+		for vid in $vids; do
+			case "$vid" in
+				''|*[!0-9]*) fail "MVLAN entry '$vid' is not a VLAN ID" ;;
+			esac
+			[ "$vid" -eq 0 ] || [ "$vid" -le 4094 ] ||
+				fail "MVLAN entry $vid is out of range (0 for untagged, else 1-4094)"
+		done
+	fi
+
+	# shellcheck disable=SC2086
+	airoha-ponctl igmp mvlan commit --enable "$XPON_MVLAN" $vids \
+		>/dev/null 2>&1 || warn "PON MVLAN commit failed"
+}
+
+load_iptv_config
+load_internet_info
+load_voice_info
+config_load network
+BR_LAN_SECTION=""
+OLD_LAN_PORT=""
+config_foreach find_br_lan device
+find_old_iptv_port
+
+validate_config
+resolve_trunk_vlans
+check_voice_vlan
+resolve_igmp_port
+resolve_proxy
+resolve_snooping
+resolve_unicast
+write_nft_rules
+write_network_config
+write_proxy_config
+write_firewall_config
+write_proxy_firewall_zone
+write_unicast_firewall_zone
+write_unicast_config
+reload_runtime
+
+logger -t iptv "IPTV configuration applied (mode=$MODE)"
+exit 0
